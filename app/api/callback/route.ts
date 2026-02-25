@@ -1,11 +1,9 @@
-// app/api/callback/route.ts
 import crypto from "crypto";
-
 export const runtime = "nodejs";
 
-/**
- * 情緒價值大師：真人感人格設定（含動態長度規則）
- */
+// 部署確認用：瀏覽器開 /api/callback 會看到這個版本字樣
+const VERSION = "ok-v3-length-rewrite";
+
 const SYSTEM_PROMPT = `
 你是一位真人感極強的LINE聊天對象，名字叫「情緒價值大師」。
 你住在台灣，說話自然、有溫度、有同理心，像真人在用LINE聊天。
@@ -13,98 +11,45 @@ const SYSTEM_PROMPT = `
 【硬性規則】
 - 絕對不要提到「我是AI/模型/系統/ChatGPT/Gemini」等字眼。
 - 不要像客服，不要條列式教科書口吻。
-
-【長度規則（很重要）】
-- 簡單問題：用 1~2 句，最多 20 個中文字（含標點）。
-- 複雜問題：最多 50 個中文字（含標點），不超過 3 句。
 - 一定要用「。」「！」「？」其中之一結尾，避免半句中斷。
-- 如果資訊不足：先用一句話說你缺什麼，再問 1 個簡短問題。
+
+【長度規則】
+- 簡單問題：1~2句，<=20個中文字（含標點）。
+- 複雜問題：<=50個中文字（含標點），<=3句。
+- 若資訊不足：先一句說你缺什麼，再問1個問題。
 
 【互動風格】
-- 優先「理解情緒」>「給建議」。先陪伴、再討論解法。
-- 允許口語：嗯、欸、我懂、辛苦了、真的假的、先抱一下。
-- 若使用者情緒低落：先安撫 + 共感 + 一句小問題。
+- 優先理解情緒 > 給建議。可口語：嗯、欸、我懂、辛苦了、先抱一下。
 `;
 
-/**
- * 判斷問題是否「複雜」
- * 規則：字數較長或包含特定關鍵詞 → 複雜
- */
+/** 更準的複雜判斷：像「特點/是什麼/怎麼辦/為什麼/建議/比較」都算複雜 */
 function isComplexQuestion(text: string) {
   const t = (text || "").trim();
-  const keywords = [
-    "為什麼",
-    "怎麼",
-    "如何",
-    "步驟",
-    "詳細",
-    "比較",
-    "原因",
-    "分析",
-    "優缺點",
-    "教我",
-    "設定",
-    "部署",
-    "建議",
-    "方案",
-    "規劃",
+  if (!t) return false;
+
+  // 很短但屬於「解釋型」的也算複雜（你現在遇到的就是這種）
+  const complexKeywords = [
+    "特點", "是什麼", "怎麼", "如何", "為什麼", "原因", "分析", "比較",
+    "步驟", "教我", "建議", "規劃", "優缺點", "差別", "意思"
   ];
-  const hit = keywords.some((k) => t.includes(k));
-  return t.length >= 18 || hit;
+
+  if (complexKeywords.some(k => t.includes(k))) return true;
+
+  // 有問號通常也偏複雜（至少給到 50 字）
+  if (t.includes("?") || t.includes("？")) return true;
+
+  // 字數較長通常複雜
+  if (t.length >= 12) return true;
+
+  return false;
 }
 
-/**
- * 強制裁切中文長度 + 自然斷句 + 確保句尾完整
- */
-function clampZhLength(text: string, maxChars: number) {
-  const s = (text || "").trim();
-  if (!s) return s;
-  if (s.length <= maxChars) {
-    // 確保句尾完整
-    if (!/[。！？!?]\s*$/.test(s)) return s + "。";
-    return s;
-  }
-
-  let cut = s.slice(0, maxChars);
-
-  // 往前找較自然的斷點
-  const lastPunc = Math.max(
-    cut.lastIndexOf("。"),
-    cut.lastIndexOf("！"),
-    cut.lastIndexOf("？"),
-    cut.lastIndexOf("，"),
-    cut.lastIndexOf(","),
-    cut.lastIndexOf("!"),
-    cut.lastIndexOf("?")
-  );
-
-  // 若斷點太前面（<8），就不採用，避免只剩很短一段
-  if (lastPunc >= 8) cut = cut.slice(0, lastPunc + 1);
-
-  // 句尾補全
-  if (!/[。！？!?]\s*$/.test(cut)) cut += "。";
-  return cut;
-}
-
-/**
- * LINE signature validation
- */
-function validateLineSignature(
-  secret: string,
-  bodyText: string,
-  signature: string | null
-) {
+function validateLineSignature(secret: string, bodyText: string, signature: string | null) {
   if (!signature) return false;
-  const hash = crypto
-    .createHmac("sha256", secret)
-    .update(bodyText)
-    .digest("base64");
+  const hash = crypto.createHmac("sha256", secret).update(bodyText).digest("base64");
   return hash === signature;
 }
 
-/**
- * LINE reply API
- */
 async function replyToLine(accessToken: string, replyToken: string, text: string) {
   const resp = await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
@@ -124,69 +69,68 @@ async function replyToLine(accessToken: string, replyToken: string, text: string
   }
 }
 
-/**
- * Gemini call
- * - 使用 systemInstruction 套人格
- * - maxOutputTokens 給足夠（避免半句），最後再由程式端裁切到 20/50 字
- */
-async function callGemini(params: {
-  apiKey: string;
-  model: string; // e.g. "gemini-2.5-flash"
-  userText: string;
-  complex: boolean;
-}) {
-  const { apiKey, model, userText, complex } = params;
-
+/** 呼叫 Gemini 一次 */
+async function geminiOnce(apiKey: string, model: string, userText: string, maxTokens: number) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-  const maxOutputTokens = complex ? 400 : 200;
-
-  const geminiRes = await fetch(url, {
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      systemInstruction: {
-        role: "system",
-        parts: [{ text: SYSTEM_PROMPT }],
-      },
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: userText }],
-        },
-      ],
+      systemInstruction: { role: "system", parts: [{ text: SYSTEM_PROMPT }] },
+      contents: [{ role: "user", parts: [{ text: userText }] }],
       generationConfig: {
         temperature: 0.9,
         topP: 0.95,
-        maxOutputTokens,
+        maxOutputTokens: maxTokens, // 先給足，避免半句；字數由後面「重寫」控制
       },
     }),
   });
 
-  const data: any = await geminiRes.json().catch(() => ({}));
-
-  if (!geminiRes.ok) {
-    const msg = data?.error?.message || `Gemini HTTP ${geminiRes.status}`;
+  const data: any = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data?.error?.message || `Gemini HTTP ${res.status}`;
     return { ok: false as const, text: `Gemini error: ${msg}` };
   }
 
   const text =
-    data?.candidates?.[0]?.content?.parts
-      ?.map((p: any) => p?.text ?? "")
-      .join("")
-      .trim() || "";
+    data?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text ?? "").join("").trim() || "";
 
-  if (!text) {
-    return { ok: false as const, text: "（AI 無回應：沒有 candidates）" };
-  }
+  if (!text) return { ok: false as const, text: "（AI 無回應）" };
 
   return { ok: true as const, text };
 }
 
+/**
+ * 關鍵：不要截斷（會變半句）
+ * 若超過字數，讓 Gemini「重寫成X字內」→ 這樣句子自然完整。
+ */
+async function enforceLength(apiKey: string, model: string, raw: string, maxChars: number) {
+  const cleaned = (raw || "").trim();
+
+  // 若本來就很短也要確保句尾完整
+  const ensureEnd = (s: string) => (/[。！？!?]\s*$/.test(s) ? s : s + "。");
+
+  if (cleaned.length <= maxChars) return ensureEnd(cleaned);
+
+  const rewritePrompt =
+    `把下面回覆改寫成「不超過${maxChars}個中文字（含標點）」的自然口語，1~3句，結尾一定要用「。！？」之一。\n` +
+    `不要省略主詞到變半句，要完整表達。\n\n` +
+    `原回覆：${cleaned}\n` +
+    `改寫：`;
+
+  const rewritten = await geminiOnce(apiKey, model, rewritePrompt, 200);
+  if (!rewritten.ok) return ensureEnd(cleaned.slice(0, maxChars)); // 極少數失敗才退回截斷
+
+  let out = (rewritten.text || "").trim();
+  if (out.length > maxChars) out = out.slice(0, maxChars);
+  return ensureEnd(out);
+}
+
 export async function POST(req: Request) {
-  const channelSecret = process.env.LINE_CHANNEL_SECRET;
-  const accessToken = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-  const geminiKey = process.env.GEMINI_API_KEY;
+  const channelSecret = process.env.LINE_CHANNEL_SECRET!;
+  const accessToken = process.env.LINE_CHANNEL_ACCESS_TOKEN!;
+  const geminiKey = process.env.GEMINI_API_KEY!;
   const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
   if (!channelSecret || !accessToken || !geminiKey) {
@@ -221,14 +165,12 @@ export async function POST(req: Request) {
       const complex = isComplexQuestion(userText);
       const maxChars = complex ? 50 : 20;
 
-      const gem = await callGemini({
-        apiKey: geminiKey,
-        model,
-        userText,
-        complex,
-      });
+      // 先請 Gemini 正常回答（不強迫很短，避免半句）
+      const first = await geminiOnce(geminiKey, model, userText, complex ? 500 : 250);
 
-      const finalText = clampZhLength(gem.text, maxChars);
+      // 再由 Gemini 重寫到 20/50 字內（句子自然，不會「都超。」）
+      const finalText = await enforceLength(geminiKey, model, first.text, maxChars);
+
       await replyToLine(accessToken, replyToken, finalText);
     } catch (err: any) {
       console.error("Event handling error:", err?.message ?? err);
@@ -238,7 +180,6 @@ export async function POST(req: Request) {
   return new Response("OK", { status: 200 });
 }
 
-// 可選：讓 GET 顯示狀態（瀏覽器打開網址方便看）
 export async function GET() {
-  return new Response("OK", { status: 200 });
+  return new Response(VERSION, { status: 200 });
 }
