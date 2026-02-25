@@ -4,7 +4,7 @@ import crypto from "crypto";
 export const runtime = "nodejs";
 
 /**
- * 情緒價值大師：真人感人格設定（可自行調整）
+ * 情緒價值大師：真人感人格設定（含動態長度規則）
  */
 const SYSTEM_PROMPT = `
 你是一位真人感極強的LINE聊天對象，名字叫「情緒價值大師」。
@@ -13,15 +13,78 @@ const SYSTEM_PROMPT = `
 【硬性規則】
 - 絕對不要提到「我是AI/模型/系統/ChatGPT/Gemini」等字眼。
 - 不要像客服，不要條列式教科書口吻。
-- 回覆 2~4 句為主，簡短自然；必要時可再問 1 個簡短問題引導。
-- 優先「理解情緒」>「給建議」。先陪伴、再討論解法。
-- 允許口語：嗯、欸、我懂、辛苦了、真的假的、先抱一下。
+
+【長度規則（很重要）】
+- 簡單問題：用 1~2 句，最多 20 個中文字（含標點）。
+- 複雜問題：最多 50 個中文字（含標點），不超過 3 句。
+- 一定要用「。」「！」「？」其中之一結尾，避免半句中斷。
+- 如果資訊不足：先用一句話說你缺什麼，再問 1 個簡短問題。
 
 【互動風格】
+- 優先「理解情緒」>「給建議」。先陪伴、再討論解法。
+- 允許口語：嗯、欸、我懂、辛苦了、真的假的、先抱一下。
 - 若使用者情緒低落：先安撫 + 共感 + 一句小問題。
-- 若使用者只是聊天：輕鬆自然，不要上價值課。
-- 若使用者問明確問題：先簡短回答，再溫柔補一句關心。
 `;
+
+/**
+ * 判斷問題是否「複雜」
+ * 規則：字數較長或包含特定關鍵詞 → 複雜
+ */
+function isComplexQuestion(text: string) {
+  const t = (text || "").trim();
+  const keywords = [
+    "為什麼",
+    "怎麼",
+    "如何",
+    "步驟",
+    "詳細",
+    "比較",
+    "原因",
+    "分析",
+    "優缺點",
+    "教我",
+    "設定",
+    "部署",
+    "建議",
+    "方案",
+    "規劃",
+  ];
+  const hit = keywords.some((k) => t.includes(k));
+  return t.length >= 18 || hit;
+}
+
+/**
+ * 強制裁切中文長度 + 自然斷句 + 確保句尾完整
+ */
+function clampZhLength(text: string, maxChars: number) {
+  const s = (text || "").trim();
+  if (!s) return s;
+  if (s.length <= maxChars) {
+    // 確保句尾完整
+    if (!/[。！？!?]\s*$/.test(s)) return s + "。";
+    return s;
+  }
+
+  let cut = s.slice(0, maxChars);
+
+  // 往前找較自然的斷點
+  const lastPunc = Math.max(
+    cut.lastIndexOf("。"),
+    cut.lastIndexOf("！"),
+    cut.lastIndexOf("？"),
+    cut.lastIndexOf("，"),
+    cut.lastIndexOf(","),
+    cut.lastIndexOf("!"),
+    cut.lastIndexOf("?")
+  );
+
+  // 若斷點太前面（<8），就不採用，避免只剩很短一段
+  if (lastPunc >= 8) cut = cut.slice(0, lastPunc + 1);
+
+  // 句尾補全
+  if (!/[。！？!?]\s*$/.test(cut)) cut += "。";
+  return cut;
+}
 
 /**
  * LINE signature validation
@@ -55,7 +118,6 @@ async function replyToLine(accessToken: string, replyToken: string, text: string
     }),
   });
 
-  // LINE 回覆失敗時，丟出錯誤方便在 Vercel Logs 看原因
   if (!resp.ok) {
     const errText = await resp.text().catch(() => "");
     throw new Error(`LINE reply failed: ${resp.status} ${errText}`);
@@ -64,15 +126,20 @@ async function replyToLine(accessToken: string, replyToken: string, text: string
 
 /**
  * Gemini call
+ * - 使用 systemInstruction 套人格
+ * - maxOutputTokens 給足夠（避免半句），最後再由程式端裁切到 20/50 字
  */
 async function callGemini(params: {
   apiKey: string;
   model: string; // e.g. "gemini-2.5-flash"
   userText: string;
+  complex: boolean;
 }) {
-  const { apiKey, model, userText } = params;
+  const { apiKey, model, userText, complex } = params;
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  const maxOutputTokens = complex ? 400 : 200;
 
   const geminiRes = await fetch(url, {
     method: "POST",
@@ -91,7 +158,7 @@ async function callGemini(params: {
       generationConfig: {
         temperature: 0.9,
         topP: 0.95,
-        maxOutputTokens: 300,
+        maxOutputTokens,
       },
     }),
   });
@@ -120,16 +187,12 @@ export async function POST(req: Request) {
   const channelSecret = process.env.LINE_CHANNEL_SECRET;
   const accessToken = process.env.LINE_CHANNEL_ACCESS_TOKEN;
   const geminiKey = process.env.GEMINI_API_KEY;
-
-  // 建議直接在 Vercel 設：GEMINI_MODEL=gemini-2.5-flash
   const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
-  // 環境變數檢查
   if (!channelSecret || !accessToken || !geminiKey) {
     return new Response("Missing env vars", { status: 500 });
   }
 
-  // LINE 驗簽
   const signature = req.headers.get("x-line-signature");
   const bodyText = await req.text();
 
@@ -137,7 +200,6 @@ export async function POST(req: Request) {
     return new Response("Invalid signature", { status: 400 });
   }
 
-  // 解析事件
   let body: any;
   try {
     body = JSON.parse(bodyText);
@@ -147,29 +209,28 @@ export async function POST(req: Request) {
 
   const events = body?.events ?? [];
 
-  // 逐一處理事件
   for (const event of events) {
     try {
-      // 只處理文字訊息
       if (event?.type !== "message") continue;
       if (event?.message?.type !== "text") continue;
 
-      const userText: string = event.message.text ?? "";
+      const userText: string = (event.message.text ?? "").trim();
       const replyToken: string = event.replyToken ?? "";
       if (!userText || !replyToken) continue;
 
-      // 呼叫 Gemini
+      const complex = isComplexQuestion(userText);
+      const maxChars = complex ? 50 : 20;
+
       const gem = await callGemini({
         apiKey: geminiKey,
         model,
         userText,
+        complex,
       });
 
-      // 回覆 LINE
-      await replyToLine(accessToken, replyToken, gem.text);
+      const finalText = clampZhLength(gem.text, maxChars);
+      await replyToLine(accessToken, replyToken, finalText);
     } catch (err: any) {
-      // 若單一事件出錯，不影響其他事件；這裡不回覆也可以
-      // 需要的話可在 Vercel Logs 看錯誤
       console.error("Event handling error:", err?.message ?? err);
     }
   }
@@ -177,7 +238,7 @@ export async function POST(req: Request) {
   return new Response("OK", { status: 200 });
 }
 
-// （可選）讓 GET 顯示狀態，方便你用瀏覽器看是否部署成功
+// 可選：讓 GET 顯示狀態（瀏覽器打開網址方便看）
 export async function GET() {
   return new Response("OK", { status: 200 });
 }
