@@ -1,185 +1,157 @@
 import crypto from "crypto";
+
 export const runtime = "nodejs";
 
-// 部署確認用：瀏覽器開 /api/callback 會看到這個版本字樣
-const VERSION = "ok-v3-length-rewrite";
+const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || "";
+const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 
-const SYSTEM_PROMPT = `
-你是一位真人感極強的LINE聊天對象，名字叫「情緒價值大師」。
-你住在台灣，說話自然、有溫度、有同理心，像真人在用LINE聊天。
+const GROQ_MODEL = "llama-3.3-70b-versatile";
+const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
 
-【硬性規則】
-- 絕對不要提到「我是AI/模型/系統/ChatGPT/Gemini」等字眼。
-- 不要像客服，不要條列式教科書口吻。
-- 一定要用「。」「！」「？」其中之一結尾，避免半句中斷。
+// ---- 去重：記錄已處理的 message.id（避免 webhook 重送反覆扣 tokens） ----
+const processed = new Map<string, number>(); // id -> timestamp(ms)
+const DEDUP_TTL_MS = 5 * 60 * 1000; // 5分鐘
 
-【長度規則】
-- 簡單問題：1~2句，<=20個中文字（含標點）。
-- 複雜問題：<=50個中文字（含標點），<=3句。
-- 若資訊不足：先一句說你缺什麼，再問1個問題。
+function isDuplicate(messageId?: string) {
+  if (!messageId) return false;
+  const now = Date.now();
 
-【互動風格】
-- 優先理解情緒 > 給建議。可口語：嗯、欸、我懂、辛苦了、先抱一下。
-`;
+  // 清理過期
+  for (const [k, ts] of processed.entries()) {
+    if (now - ts > DEDUP_TTL_MS) processed.delete(k);
+  }
 
-/** 更準的複雜判斷：像「特點/是什麼/怎麼辦/為什麼/建議/比較」都算複雜 */
-function isComplexQuestion(text: string) {
-  const t = (text || "").trim();
-  if (!t) return false;
-
-  // 很短但屬於「解釋型」的也算複雜（你現在遇到的就是這種）
-  const complexKeywords = [
-    "特點", "是什麼", "怎麼", "如何", "為什麼", "原因", "分析", "比較",
-    "步驟", "教我", "建議", "規劃", "優缺點", "差別", "意思"
-  ];
-
-  if (complexKeywords.some(k => t.includes(k))) return true;
-
-  // 有問號通常也偏複雜（至少給到 50 字）
-  if (t.includes("?") || t.includes("？")) return true;
-
-  // 字數較長通常複雜
-  if (t.length >= 12) return true;
-
+  if (processed.has(messageId)) return true;
+  processed.set(messageId, now);
   return false;
 }
 
-function validateLineSignature(secret: string, bodyText: string, signature: string | null) {
-  if (!signature) return false;
-  const hash = crypto.createHmac("sha256", secret).update(bodyText).digest("base64");
+function badRequest(msg: string, status = 400) {
+  return new Response(msg, { status });
+}
+
+async function verifyLineSignature(rawBody: string, signature: string) {
+  const hash = crypto
+    .createHmac("sha256", LINE_CHANNEL_SECRET)
+    .update(rawBody)
+    .digest("base64");
   return hash === signature;
 }
 
-async function replyToLine(accessToken: string, replyToken: string, text: string) {
-  const resp = await fetch("https://api.line.me/v2/bot/message/reply", {
+function isComplexQuestion(text: string) {
+  const t = text.trim();
+  const complexHints = ["為什麼", "怎麼", "如何", "可以嗎", "教我", "步驟", "比較", "分析", "建議", "規劃"];
+  if (complexHints.some((k) => t.includes(k))) return true;
+  return t.length > 20;
+}
+
+function finalizeText(text: string, maxChars: number) {
+  let out = (text || "").trim();
+  out = out.replace(/\s+/g, " ");
+  if (!out) out = "嗯…你再說一次我聽聽？";
+
+  if (out.length > maxChars) out = out.slice(0, maxChars);
+  if (!/[。！？…]$/.test(out)) out += "。";
+  if (out.length > maxChars) {
+    out = out.slice(0, maxChars);
+    if (!/[。！？…]$/.test(out)) out = out.slice(0, maxChars - 1) + "。";
+  }
+  return out;
+}
+
+async function callGroq(userText: string, maxChars: number) {
+  const maxTokens = maxChars <= 20 ? 120 : 220;
+
+  const system = [
+    "你是「情緒價值大師」，用真人口吻在 LINE 聊天。",
+    "規則：",
+    `1) 回覆不超過 ${maxChars} 個中文字（含標點），用 1~3 句完整句子。`,
+    "2) 不要像客服、不要條列、不要說你是 AI。",
+    "3) 回覆要自然、溫暖、有點幽默但不油。",
+    "4) 結尾要是完整句，避免半句中斷。",
+  ].join("\n");
+
+  const resp = await fetch(GROQ_ENDPOINT, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${accessToken}`,
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL, // <-- 這行就保證是 Llama 3.3
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: userText },
+      ],
+      temperature: 0.9,
+      max_tokens: maxTokens,
+    }),
+  });
+
+  const data: any = await resp.json().catch(() => ({}));
+
+  if (!resp.ok) {
+    const msg = data?.error?.message || `Groq HTTP ${resp.status}`;
+    return `（AI 暫時卡住：${msg}）`;
+  }
+
+  const text = (data?.choices?.[0]?.message?.content || "").trim();
+  return text;
+}
+
+async function replyToLine(replyToken: string, text: string) {
+  await fetch("https://api.line.me/v2/bot/message/reply", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
       replyToken,
-      messages: [{ type: "text", text: text.slice(0, 4900) }],
+      messages: [{ type: "text", text }],
     }),
   });
-
-  if (!resp.ok) {
-    const errText = await resp.text().catch(() => "");
-    throw new Error(`LINE reply failed: ${resp.status} ${errText}`);
-  }
-}
-
-/** 呼叫 Gemini 一次 */
-async function geminiOnce(apiKey: string, model: string, userText: string, maxTokens: number) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: { role: "system", parts: [{ text: SYSTEM_PROMPT }] },
-      contents: [{ role: "user", parts: [{ text: userText }] }],
-      generationConfig: {
-        temperature: 0.9,
-        topP: 0.95,
-        maxOutputTokens: maxTokens, // 先給足，避免半句；字數由後面「重寫」控制
-      },
-    }),
-  });
-
-  const data: any = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const msg = data?.error?.message || `Gemini HTTP ${res.status}`;
-    return { ok: false as const, text: `Gemini error: ${msg}` };
-  }
-
-  const text =
-    data?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text ?? "").join("").trim() || "";
-
-  if (!text) return { ok: false as const, text: "（AI 無回應）" };
-
-  return { ok: true as const, text };
-}
-
-/**
- * 關鍵：不要截斷（會變半句）
- * 若超過字數，讓 Gemini「重寫成X字內」→ 這樣句子自然完整。
- */
-async function enforceLength(apiKey: string, model: string, raw: string, maxChars: number) {
-  const cleaned = (raw || "").trim();
-
-  // 若本來就很短也要確保句尾完整
-  const ensureEnd = (s: string) => (/[。！？!?]\s*$/.test(s) ? s : s + "。");
-
-  if (cleaned.length <= maxChars) return ensureEnd(cleaned);
-
-  const rewritePrompt =
-    `把下面回覆改寫成「不超過${maxChars}個中文字（含標點）」的自然口語，1~3句，結尾一定要用「。！？」之一。\n` +
-    `不要省略主詞到變半句，要完整表達。\n\n` +
-    `原回覆：${cleaned}\n` +
-    `改寫：`;
-
-  const rewritten = await geminiOnce(apiKey, model, rewritePrompt, 200);
-  if (!rewritten.ok) return ensureEnd(cleaned.slice(0, maxChars)); // 極少數失敗才退回截斷
-
-  let out = (rewritten.text || "").trim();
-  if (out.length > maxChars) out = out.slice(0, maxChars);
-  return ensureEnd(out);
 }
 
 export async function POST(req: Request) {
-  const channelSecret = process.env.LINE_CHANNEL_SECRET!;
-  const accessToken = process.env.LINE_CHANNEL_ACCESS_TOKEN!;
-  const geminiKey = process.env.GEMINI_API_KEY!;
-  const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-
-  if (!channelSecret || !accessToken || !geminiKey) {
-    return new Response("Missing env vars", { status: 500 });
+  if (!LINE_CHANNEL_ACCESS_TOKEN || !LINE_CHANNEL_SECRET || !GROQ_API_KEY) {
+    return badRequest(
+      "Missing env vars: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET / GROQ_API_KEY",
+      500
+    );
   }
 
-  const signature = req.headers.get("x-line-signature");
-  const bodyText = await req.text();
+  const signature = req.headers.get("x-line-signature") || "";
+  const rawBody = await req.text();
 
-  if (!validateLineSignature(channelSecret, bodyText, signature)) {
-    return new Response("Invalid signature", { status: 400 });
-  }
+  const ok = await verifyLineSignature(rawBody, signature);
+  if (!ok) return badRequest("Invalid signature", 401);
 
-  let body: any;
-  try {
-    body = JSON.parse(bodyText);
-  } catch {
-    return new Response("Bad JSON", { status: 400 });
-  }
-
-  const events = body?.events ?? [];
+  const body = JSON.parse(rawBody);
+  const events = body?.events || [];
 
   for (const event of events) {
-    try {
-      if (event?.type !== "message") continue;
-      if (event?.message?.type !== "text") continue;
+    if (event?.type !== "message") continue;
+    if (event?.message?.type !== "text") continue;
 
-      const userText: string = (event.message.text ?? "").trim();
-      const replyToken: string = event.replyToken ?? "";
-      if (!userText || !replyToken) continue;
-
-      const complex = isComplexQuestion(userText);
-      const maxChars = complex ? 50 : 20;
-
-      // 先請 Gemini 正常回答（不強迫很短，避免半句）
-      const first = await geminiOnce(geminiKey, model, userText, complex ? 500 : 250);
-
-      // 再由 Gemini 重寫到 20/50 字內（句子自然，不會「都超。」）
-      const finalText = await enforceLength(geminiKey, model, first.text, maxChars);
-
-      await replyToLine(accessToken, replyToken, finalText);
-    } catch (err: any) {
-      console.error("Event handling error:", err?.message ?? err);
+    const messageId: string | undefined = event?.message?.id;
+    if (isDuplicate(messageId)) {
+      // 重送就直接不打 AI、不扣 tokens
+      continue;
     }
+
+    const userText: string = (event.message.text || "").trim();
+    const replyToken: string = event.replyToken;
+
+    const complex = isComplexQuestion(userText);
+    const maxChars = complex ? 50 : 20;
+
+    const aiText = await callGroq(userText, maxChars);
+    const finalText = finalizeText(aiText, maxChars);
+
+    await replyToLine(replyToken, finalText);
   }
 
-  return new Response("OK", { status: 200 });
-}
-
-export async function GET() {
-  return new Response(VERSION, { status: 200 });
+  return new Response("ok");
 }
