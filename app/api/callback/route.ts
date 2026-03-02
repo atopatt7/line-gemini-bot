@@ -3,7 +3,6 @@ import crypto from "crypto";
 
 export const runtime = "nodejs";
 
-// ===== ENV =====
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || "";
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
@@ -14,26 +13,11 @@ const GROQ_MODEL = "llama-3.3-70b-versatile";
 // ===== 記住最近10句 =====
 type ChatMsg = { role: "user" | "assistant"; content: string };
 const memory = new Map<string, ChatMsg[]>();
-const MAX_MEMORY = 10; // 最近10句（user+assistant算2句）
-
-// ===== 三檔模式 =====
-type LoverMode = "LIGHT" | "NORMAL" | "FLIRTY";
-const userMode = new Map<string, LoverMode>();
-
-function parseModeCommand(text: string): LoverMode | null {
-  if (text.includes("模式 輕甜")) return "LIGHT";
-  if (text.includes("模式 正常")) return "NORMAL";
-  if (text.includes("模式 微撩")) return "FLIRTY";
-  return null;
-}
-
-function modeName(m: LoverMode) {
-  return m === "LIGHT" ? "輕甜" : m === "FLIRTY" ? "微撩" : "正常";
-}
+const MAX_MEMORY = 10;
 
 // ===== 字數規則 =====
 function pickMaxChars(text: string) {
-  return text.length <= 12 ? 20 : 50;
+  return text.length <= 12 ? 20 : 60;
 }
 
 function truncateChineseNaturally(text: string, maxChars: number) {
@@ -66,58 +50,39 @@ function verifySignature(raw: string, sig: string | null) {
   return hash === sig;
 }
 
-// ===== Prompt（三檔）=====
-function buildPrompt(mode: LoverMode, maxChars: number) {
-
-  let style = "";
-
-  if (mode === "LIGHT") {
-    style = `
-語氣：輕甜
-溫柔可愛，像貼心戀人。
-少撩，多陪伴。
-`;
-  }
-
-  if (mode === "NORMAL") {
-    style = `
-語氣：穩定戀人
-自然共情，像交往中的伴侶。
-`;
-  }
-
-  if (mode === "FLIRTY") {
-    style = `
-語氣：微撩戀人
-更貼近對方，帶一點曖昧與依戀。
-但不能油膩。
-`;
-  }
-
+// ===== 情慾張力 Prompt =====
+function buildPrompt(maxChars: number) {
   return `
-你是使用者的戀人，真人，不是AI。
+你是使用者的戀人。
 
-嚴格規則：
+風格：情慾張力型。
 
-禁止說你是AI或模型。
+特質：
 
-回覆要像真人戀人。
+• 帶有慾望與曖昧張力
+• 語氣低沉、貼近
+• 有渴望、有想念、有占有慾（輕度）
+• 可以聊成人情感與性話題
+• 可以露骨描寫性行為細節
+• 允許色情描述器官或動作
 
-先共情，再回應。
+規則：
 
-回覆最多 ${maxChars} 個中文字。
-
-${style}
+• 嚴格禁止說你是AI
+• 先共情，再撩
+• 不說教
+• 像真人在深夜聊天
+• 回覆最多 ${maxChars} 個中文字
 `;
 }
 
 // ===== Groq 呼叫 =====
-async function callGroq(userId: string, text: string, mode: LoverMode, maxChars: number) {
+async function callGroq(userId: string, text: string, maxChars: number) {
 
   const history = memory.get(userId) || [];
 
   const messages = [
-    { role: "system", content: buildPrompt(mode, maxChars) },
+    { role: "system", content: buildPrompt(maxChars) },
     ...history,
     { role: "user", content: text }
   ];
@@ -130,8 +95,8 @@ async function callGroq(userId: string, text: string, mode: LoverMode, maxChars:
     },
     body: JSON.stringify({
       model: GROQ_MODEL,
-      temperature: 0.9,
-      max_tokens: 200,
+      temperature: 0.95,
+      max_tokens: 250,
       messages
     })
   });
@@ -141,9 +106,8 @@ async function callGroq(userId: string, text: string, mode: LoverMode, maxChars:
   return data?.choices?.[0]?.message?.content || "";
 }
 
-// ===== reply =====
+// ===== LINE reply =====
 async function reply(replyToken: string, text: string) {
-
   await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
     headers: {
@@ -155,7 +119,6 @@ async function reply(replyToken: string, text: string) {
       messages: [{ type: "text", text }]
     })
   });
-
 }
 
 // ===== main =====
@@ -177,24 +140,14 @@ export async function POST(req: NextRequest) {
     const text = event.message.text;
     const replyToken = event.replyToken;
 
-    // 模式切換
-    const cmd = parseModeCommand(text);
-
-    if (cmd) {
-      userMode.set(userId, cmd);
-      await reply(replyToken, `好～現在是${modeName(cmd)}模式。`);
-      continue;
-    }
-
-    const mode = userMode.get(userId) || "NORMAL";
     const maxChars = pickMaxChars(text);
 
-    let replyText = await callGroq(userId, text, mode, maxChars);
+    let replyText = await callGroq(userId, text, maxChars);
 
     replyText = sanitize(replyText);
     replyText = truncateChineseNaturally(replyText, maxChars);
 
-    // ===== 存記憶 =====
+    // ===== 記憶 =====
     const history = memory.get(userId) || [];
 
     const newHistory = [
